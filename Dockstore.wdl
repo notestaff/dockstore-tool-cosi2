@@ -18,8 +18,8 @@ struct ReplicaInfo {
   String blockNum
   Int replicaNum
   Int succeeded
-    Int         randomSeed
-    File        tpeds
+  Int         randomSeed
+  File        tpeds
   File traj
   Int  selPop
   Float selGen
@@ -44,7 +44,7 @@ task cosi2_run_one_sim_block {
 
     ## optional
     nSimsInBlock: "number of simulations in this block"
-    maxAttempts: ""
+    maxAttempts: "max number of attempts to simulate forward frequency trajectory before failing"
 
     # Outputs
     replicaInfos: "array of replica infos"
@@ -59,45 +59,27 @@ task cosi2_run_one_sim_block {
     Int          blockNum
     Int          nSimsInBlock = 1
     Int          maxAttempts = 10000000
-    Int          randomSeed = 0
     String       cosi2_docker = "quay.io/ilya_broad/dockstore-tool-cosi2@sha256:11df3a646c563c39b6cbf71490ec5cd90c1025006102e301e62b9d0794061e6a"
+    File         taskScript
   }
 
+  File inp_json = write_json(object {
+    paramFileCommon: paramFileCommon,
+    paramFile: paramFile,
+    recombFile: recombFile,
+    simBlockId: simBlockId,
+    modelId: modelId,
+    blockNum: blockNum,
+    nSimsInBlock: nSimsInBlock,
+    maxAttempts: maxAttempts
+    })
+
   command <<<
-  python3 <<CODE
-
-  import platform
-  print(platform.version())
-
-  CODE
-
-  echo -e "modelId\tblockNum\treplicaNum\tsucceeded\trandomSeed\ttpeds\ttraj\tsimNum\tselPop\tselGen\tselBegPop\tselBegGen\tselCoeff\tselFreq" > allinfo.full.tsv
-
-  cat ~{paramFileCommon} ~{paramFile} > paramFileCombined
-  grep -v "recomb_file" "paramFileCombined" > ~{simBlockId}.fixed.par
-  echo "recomb_file ~{recombFile}" >> ~{simBlockId}.fixed.par
-
-  for rep in `seq 1 ~{nSimsInBlock}`;
-  do
-
-    if [ "~{randomSeed}" -eq "0" ]; then
-       cat /dev/urandom | od -vAn -N4 -tu4 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | sed 's/.$//' > "cosi2.${rep}.randseed"
-    else
-       echo "~{randomSeed}" > cosi2.${rep}.randseed
-    fi
-     
-    ( env COSI_NEWSIM=1 COSI_MAXATTEMPTS=~{maxAttempts} COSI_SAVE_TRAJ="~{simBlockId}.${rep}.traj" COSI_SAVE_SWEEP_INFO="sweepinfo.${rep}.tsv" coalescent -p ~{simBlockId}.fixed.par -v -g -r $(cat "cosi2.${rep}.randseed") --genmapRandomRegions --drop-singletons .25 --tped "~{simBlockId}_${rep}_" ) || ( touch "${rep}.sim_failed"  )
-
-    #echo -e 'simNum\tselPop\tselGen\tselBegPop\tselBegGen\tselCoeff\tselFreq' > sweepinfo.full.tsv
-    #cat sweepinfo.tsv >> sweepinfo.full.tsv
-
-    tar cvfz "~{simBlockId}.${rep}.tpeds.tar.gz" ~{simBlockId}_${rep}_*.tped
-    echo -e "~{modelId}\t~{blockNum}\t${rep}\t1\t$(cat cosi2.${rep}.randseed)\t~{simBlockId}.${rep}.tpeds.tar.gz\t~{simBlockId}.${rep}.traj\t$(cat sweepinfo.${rep}.tsv)" >> allinfo.full.tsv
-  done 
+    python3 ~{taskScript} ~{inp_json} out.json
   >>>
 
   output {
-    Array[ReplicaInfo] replicaInfos = read_objects("allinfo.full.tsv")
+    Array[Object] replicaInfos = read_json("out.json").replicaInfos
 
 #    String      cosi2_docker_used = ""
   }
@@ -107,7 +89,7 @@ task cosi2_run_one_sim_block {
     memory: "3 GB"
     cpu: 2
     dx_instance_type: "mem1_ssd1_v2_x4"
-    volatile: randomSeed==0
+    volatile: true  # FIXME: not volatile if random seeds specified
   }
 }
 
@@ -132,6 +114,7 @@ workflow run_sims_cosi2 {
       Int nreps = 1
       Int nSimsPerBlock = 1
       String       cosi2_docker = "quay.io/ilya_broad/dockstore-tool-cosi2@sha256:11df3a646c563c39b6cbf71490ec5cd90c1025006102e301e62b9d0794061e6a"
+      File         taskScript
     }
     Int nBlocks = nreps / nSimsPerBlock
     #Array[String] paramFileCommonLines = read_lines(paramFileCommonLines)
@@ -147,12 +130,13 @@ workflow run_sims_cosi2 {
 	           simBlockId=basename(paramFile, ".par")+"_"+blockNum,
 	           blockNum=blockNum,
 	           nSimsInBlock=nSimsPerBlock,
-	           cosi2_docker=cosi2_docker
+	           cosi2_docker=cosi2_docker,
+	           taskScript=taskScript
             }
         }
     }
 
     output {
-      Array[ReplicaInfo] replicaInfos = flatten(flatten(cosi2_run_one_sim_block.replicaInfos))
+      Array[Object] replicaInfos = flatten(flatten(cosi2_run_one_sim_block.replicaInfos))
     }
 }
