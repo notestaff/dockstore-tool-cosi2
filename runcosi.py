@@ -4,6 +4,8 @@
 
 """Run cosi2 simulation for one block"""
 
+__author__="ilya_shl@alum.mit.edu"
+
 # * imports
 
 import argparse
@@ -14,12 +16,19 @@ import functools
 import gzip
 import io
 import json
+import logging
+import multiprocessing
 import os
 import random
+import re
 import subprocess
 import sys
 
 # * Utils
+
+_log = logging.getLogger(__name__)
+
+MAX_INT32 = (2 ** 31)-1
 
 def dump_file(fname, value):
     """store string in file"""
@@ -89,12 +98,53 @@ def open_or_gzopen(fname, *opts, **kwargs):
     else:
         return open(fname, *open_opts, **kwargs)
 
+def available_cpu_count():
+    """
+    Return the number of available virtual or physical CPUs on this system.
+    The number of available CPUs can be smaller than the total number of CPUs
+    when the cpuset(7) mechanism is in use, as is the case on some cluster
+    systems.
+
+    Adapted from http://stackoverflow.com/a/1006301/715090
+    """
+
+    cgroup_cpus = MAX_INT32
+    try:
+        def get_cpu_val(name):
+            return float(slurp_file('/sys/fs/cgroup/cpu/cpu.'+name).strip())
+        cfs_quota = get_cpu_val('cfs_quota_us')
+        if cfs_quota > 0:
+            cfs_period = get_cpu_val('cfs_period_us')
+            _log.debug('cfs_quota %s, cfs_period %s', cfs_quota, cfs_period)
+            cgroup_cpus = max(1, int(cfs_quota / cfs_period))
+    except Exception as e:
+        pass
+
+    proc_cpus = MAX_INT32
+    try:
+        with open('/proc/self/status') as f:
+            status = f.read()
+        m = re.search(r'(?m)^Cpus_allowed:\s*(.*)$', status)
+        if m:
+            res = bin(int(m.group(1).replace(',', ''), 16)).count('1')
+            if res > 0:
+                proc_cpus = res
+    except IOError:
+        pass
+
+    _log.debug('cgroup_cpus %d, proc_cpus %d, multiprocessing cpus %d',
+               cgroup_cpus, proc_cpus, multiprocessing.cpu_count())
+    return min(cgroup_cpus, proc_cpus, multiprocessing.cpu_count())
+
 # * run_one_sim
 
-def run_one_replica(args, paramFile, replicaNum):
-    """Run one cosi2 replica; return a ReplicaInfo struct (defined in Dockstore.wdl)"""
+def run_one_replica(replicaNum, args, paramFile):
+    """Run one cosi2 replica; return a ReplicaInfo struct (defined in Dockstore.wdl).
 
-    randomSeed = random.SystemRandom().randint(0, 2147483646)
+    Note: replicaNum must be first arg, to facilitate concurrent.futures.Executor.map() over range of replicaNums.
+    """
+
+    randomSeed = random.SystemRandom().randint(0, MAX_INT32)
 
     tpedPrefix = f"{args.simBlockId}_rep{replicaNum}"
     trajFile = f"{args.simBlockId}.{replicaNum}.traj"
@@ -108,31 +158,29 @@ def run_one_replica(args, paramFile, replicaNum):
         f'-v -g -r {randomSeed} --genmapRandomRegions '
         f'--drop-singletons .25 --tped {tpedPrefix} )'
         )
+
+    def _load_sweep_info():
+        simNum, selPop, selGen, selBegPop, selBegGen, selCoeff, selFreq = map(float, slurp_file(sweepInfoFile).strip().split())
+        return dict(selPop=int(selPop), selGen=selGen, selBegPop=int(selBegPop), 
+                    selBegGen=selBegGen, selCoeff=selCoeff, selFreq=selFreq)
+
+    replicaInfo = dict(modelId=args.modelId, blockNum=args.blockNum,
+                       replicaNum=replicaNum, succeeded=False, randomSeed=randomSeed,
+                       tpeds=emptyFile, traj=emptyFile, selPop=0, selGen=0., selBegPop=0, selBegGen=0., selCoeff=0., selFreq=0.)
     try:
         _run(cosi2_cmd)
         # TODO: parse param file for list of pops, and check that we get all the files.
         tpeds_tar_gz = f"{args.simBlockId}.{replicaNum}.tpeds.tar.gz"
         _run(f'tar cvfz {tpeds_tar_gz} {tpedPrefix}_*.tped')
-        simNum, selPop, selGen, selBegPop, selBegGen, selCoeff, selFreq = map(float, slurp_file(sweepInfoFile).strip().split())
-        replicaInfo = dict(modelId=args.modelId, blockNum=args.blockNum,
-                           replicaNum=replicaNum, succeeded=True, randomSeed=randomSeed,
-                           tpeds=tpeds_tar_gz, traj=trajFile, selPop=int(selPop), selGen=selGen, selBegPop=int(selBegPop),
-                           selBegGen=selBegGen, selCoeff=selCoeff, selFreq=selFreq)
-    except subprocess.SubprocessError:
-        failed_replica_info = dict(modelId=args.modelId, blockNum=args.blockNum,
-                                   replicaNum=replicaNum, succeeded=False, randomSeed=randomSeed,
-                                   tpeds=emptyFile, traj=emptyFile, selPop=0, selGen=0., selBegPop=0,
-                                   selBegGen=0., selCoeff=0., selFreq=0.)
-        # TODO: save sampled params even if sim fails
-        replicaInfo = failed_replica_info
+        replicaInfo.update(succeeded=True, tpeds=tpeds_tar_gz, traj=trajFile, **_load_sweep_info())
+    except subprocess.SubprocessError as subprocessError:
+        _log.warning(f'command "{cosi2_cmd}" failed with {subprocessError}')
+
     return replicaInfo
 
 # * main
 
-def do_main():
-    """Parse args and run cosi"""
-
-
+def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--paramFileCommon', required=True, help='the common part of all parameter files')
@@ -146,16 +194,27 @@ def do_main():
                         help='max # of times to try simulating forward frequency trajectory before giving up')
 
     parser.add_argument('--outJson', required=True, help='write output json to this file')
-    args = parser.parse_args()
+    return parser.parse_args()
+
+def constructParamFile(args):
+    """Combine common and variable pars of cosi2 param file"""
 
     paramFileCombined = 'paramFileCombined.par'
     dump_file(fname=paramFileCombined, value=slurp_file(args.paramFileCommon)+slurp_file(args.paramFile))
+    return paramFileCombined
 
-    _write_json(args.outJson,
-                dict(replicaInfos=[run_one_replica(args=args,
-                                                   paramFile=paramFileCombined,
-                                                   replicaNum=replicaNum)
-                                   for replicaNum in range(args.numSimsInBlock)]))
+def do_main():
+    """Parse args and run cosi"""
+
+    args = parse_args()
+
+    with contextlib.ExitStack() as exit_stack:
+        executor = exit_stack.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=min(args.numSimsInBlock,
+                                                                                                  available_cpu_count())))
+        replicaInfos = list(executor.map(functools.partial(run_one_replica, args=args, paramFile=constructParamFile(args)),
+                                         range(args.numSimsInBlock)))
+    _write_json(args.outJson, dict(replicaInfos=replicaInfos))
     
 if __name__ == '__main__':
+    logging.basicConfig(format="%(asctime)s - %(module)s:%(lineno)d:%(funcName)s - %(levelname)s - %(message)s")
     do_main()
