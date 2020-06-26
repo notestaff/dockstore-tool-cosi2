@@ -146,11 +146,13 @@ def run_one_replica(replicaNum, args, paramFile):
 
     randomSeed = random.SystemRandom().randint(0, MAX_INT32)
 
-    tpedPrefix = f"{args.simBlockId}_rep{replicaNum}"
-    trajFile = f"{args.simBlockId}.{replicaNum}.traj"
-    sweepInfoFile = f"sweepinfo.{replicaNum}.tsv"
+    repStr = f"rep{replicaNum}"
+    blkStr = f"{args.simBlockId}.{repStr}"
+    tpedPrefix = f"{blkStr}"
+    trajFile = f"{blkStr}.traj"
+    sweepInfoFile = f"{blkStr}.sweepinfo.tsv"
     _run = functools.partial(subprocess.check_call, shell=True)
-    emptyFile = f"empty.rep{replicaNum}"
+    emptyFile = f"{blkStr}.empty"
     dump_file(emptyFile, '')
     cosi2_cmd = (
         f'(env COSI_NEWSIM=1 COSI_MAXATTEMPTS={args.maxAttempts} COSI_SAVE_TRAJ={trajFile} '
@@ -170,7 +172,7 @@ def run_one_replica(replicaNum, args, paramFile):
     try:
         _run(cosi2_cmd)
         # TODO: parse param file for list of pops, and check that we get all the files.
-        tpeds_tar_gz = f"{args.simBlockId}.{replicaNum}.tpeds.tar.gz"
+        tpeds_tar_gz = f"{blkStr}.tpeds.tar.gz"
         _run(f'tar cvfz {tpeds_tar_gz} {tpedPrefix}_*.tped')
         replicaInfo.update(succeeded=True, tpeds=tpeds_tar_gz, traj=trajFile, **_load_sweep_info())
     except subprocess.SubprocessError as subprocessError:
