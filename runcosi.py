@@ -1,7 +1,16 @@
+#!/usr/bin/env python3
+
+# * Preamble
+
 """Run cosi2 simulation for one block"""
+
+# * imports
 
 import argparse
 import collections
+import concurrent.futures
+import contextlib
+import functools
 import gzip
 import io
 import json
@@ -9,6 +18,8 @@ import os
 import random
 import subprocess
 import sys
+
+# * Utils
 
 def dump_file(fname, value):
     """store string in file"""
@@ -78,35 +89,73 @@ def open_or_gzopen(fname, *opts, **kwargs):
     else:
         return open(fname, *open_opts, **kwargs)
 
+# * run_one_sim
+
+def run_one_replica(args, paramFile, replicaNum):
+    """Run one cosi2 replica; return a ReplicaInfo struct (defined in Dockstore.wdl)"""
+
+    randomSeed = random.SystemRandom().randint(0, 2147483646)
+
+    tpedPrefix = f"{args.simBlockId}_rep{replicaNum}"
+    trajFile = f"{args.simBlockId}.{replicaNum}.traj"
+    sweepInfoFile = f"sweepinfo.{replicaNum}.tsv"
+    _run = functools.partial(subprocess.check_call, shell=True)
+    emptyFile = f"empty.rep{replicaNum}"
+    dump_file(emptyFile, '')
+    cosi2_cmd = (
+        f'(env COSI_NEWSIM=1 COSI_MAXATTEMPTS={args.maxAttempts} COSI_SAVE_TRAJ={trajFile} '
+        f'COSI_SAVE_SWEEP_INFO={sweepInfoFile} coalescent -R {args.recombFile} -p {paramFile} '
+        f'-v -g -r {randomSeed} --genmapRandomRegions '
+        f'--drop-singletons .25 --tped {tpedPrefix} )'
+        )
+    try:
+        _run(cosi2_cmd)
+        # TODO: parse param file for list of pops, and check that we get all the files.
+        tpeds_tar_gz = f"{args.simBlockId}.{replicaNum}.tpeds.tar.gz"
+        _run(f'tar cvfz {tpeds_tar_gz} {tpedPrefix}_*.tped')
+        simNum, selPop, selGen, selBegPop, selBegGen, selCoeff, selFreq = map(float, slurp_file(sweepInfoFile).strip().split())
+        replicaInfo = dict(modelId=args.modelId, blockNum=args.blockNum,
+                           replicaNum=replicaNum, succeeded=True, randomSeed=randomSeed,
+                           tpeds=tpeds_tar_gz, traj=trajFile, selPop=int(selPop), selGen=selGen, selBegPop=int(selBegPop),
+                           selBegGen=selBegGen, selCoeff=selCoeff, selFreq=selFreq)
+    except subprocess.SubprocessError:
+        failed_replica_info = dict(modelId=args.modelId, blockNum=args.blockNum,
+                                   replicaNum=replicaNum, succeeded=False, randomSeed=randomSeed,
+                                   tpeds=emptyFile, traj=emptyFile, selPop=0, selGen=0., selBegPop=0,
+                                   selBegGen=0., selCoeff=0., selFreq=0.)
+        # TODO: save sampled params even if sim fails
+        replicaInfo = failed_replica_info
+    return replicaInfo
+
+# * main
+
 def do_main():
     """Parse args and run cosi"""
 
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('params_json')
-    parser.add_argument('out_json')
-    args_tmp = parser.parse_args()
-    args = _json_loadf(args_tmp.params_json)
-    print(_pretty_print_json(args))
-    dump_file('tpeds.dummy', 'no-tpeds')
-    _write_json(args_tmp.out_json, dict(replicaInfos=[dict(modelId=args['modelId'], blockNum=args['blockNum'],
-                                                           replicaNum=0, succeeded=False, randomSeed=239,
-                                                           tpeds='tpeds.dummy', traj='tpeds.dummy', selPop=1, selGen=0., selBegPop=1,
-                                                           selBegGen=0., selCoeff=.02, selFreq=.33)]))
-    
-    #parser.add_argument('--paramFileCommon', dest='param_file_common', required=True, help='the common part of all parameter files')
-    # parser.add_argument('--paramFile', dest='param_file', required=True, help='the variable part of all parameter files')
-    # parser.add_argument('--recombFile', dest='recomb_file', required=True, help='the recombination file')
-    # parser.add_argument('--modelId', dest='model_id', required=True, help='demographic model id')
-    # parser.add_argument('--simBlockId', dest='sim_block_id', required=True, help='string ID of the simulation block')
-    # parser.add_argument('--blockNum', dest='block_num', type=int, required=True, help='number of the block of simulations')
-    # parser.add_argument('--maxAttempts', dest='max_attempts', type=int, required=True,
-    #                     help='max # of times to try simulating forward frequency trajectory before giving up')
-    # parser.add_argument('--randomSeed', dest='random_seed', type=int, required=True,
-    #                     help='random seed to use, or 0 to choose one')
-    
-    
-    
 
+    parser.add_argument('--paramFileCommon', required=True, help='the common part of all parameter files')
+    parser.add_argument('--paramFile', required=True, help='the variable part of all parameter files')
+    parser.add_argument('--recombFile', required=True, help='the recombination file')
+    parser.add_argument('--modelId', required=True, help='demographic model id')
+    parser.add_argument('--simBlockId', required=True, help='string ID of the simulation block')
+    parser.add_argument('--blockNum', type=int, required=True, help='number of the block of simulations')
+    parser.add_argument('--numSimsInBlock', type=int, required=True, help='number of replicas in the block')
+    parser.add_argument('--maxAttempts', type=int, required=True,
+                        help='max # of times to try simulating forward frequency trajectory before giving up')
+
+    parser.add_argument('--outJson', required=True, help='write output json to this file')
+    args = parser.parse_args()
+
+    paramFileCombined = 'paramFileCombined.par'
+    dump_file(fname=paramFileCombined, value=slurp_file(args.paramFileCommon)+slurp_file(args.paramFile))
+
+    _write_json(args.outJson,
+                dict(replicaInfos=[run_one_replica(args=args,
+                                                   paramFile=paramFileCombined,
+                                                   replicaNum=replicaNum)
+                                   for replicaNum in range(args.numSimsInBlock)]))
+    
 if __name__ == '__main__':
     do_main()

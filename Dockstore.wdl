@@ -63,19 +63,9 @@ task cosi2_run_one_sim_block {
     File         taskScript
   }
 
-  File inp_json = write_json(object {
-    paramFileCommon: paramFileCommon,
-    paramFile: paramFile,
-    recombFile: recombFile,
-    simBlockId: simBlockId,
-    modelId: modelId,
-    blockNum: blockNum,
-    nSimsInBlock: nSimsInBlock,
-    maxAttempts: maxAttempts
-    })
-
   command <<<
-    python3 ~{taskScript} ~{inp_json} out.json
+    python3 ~{taskScript} --paramFileCommon ~{paramFileCommon} --paramFile ~{paramFile} --recombFile ~{recombFile} \
+      --simBlockId ~{simBlockId} --modelId ~{modelId} --blockNum ~{blockNum} --numSimsInBlock ~{nSimsInBlock} --maxAttempts ~{maxAttempts} --outJson out.json
   >>>
 
   output {
