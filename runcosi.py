@@ -23,6 +23,7 @@ import random
 import re
 import subprocess
 import sys
+import time
 
 # * Utils
 
@@ -144,6 +145,8 @@ def run_one_replica(replicaNum, args, paramFile):
     Note: replicaNum must be first arg, to facilitate concurrent.futures.Executor.map() over range of replicaNums.
     """
 
+    time_beg = time.time()
+
     randomSeed = random.SystemRandom().randint(0, MAX_INT32)
 
     repStr = f"rep{replicaNum}"
@@ -173,10 +176,12 @@ def run_one_replica(replicaNum, args, paramFile):
         _run(cosi2_cmd)
         # TODO: parse param file for list of pops, and check that we get all the files.
         tpeds_tar_gz = f"{blkStr}.tpeds.tar.gz"
-        _run(f'tar cvfz {tpeds_tar_gz} {tpedPrefix}_*.tped')
+        _run(f'tar cvfz {tpeds_tar_gz} {tpedPrefix}_*.tped', timeout=args.repTimeoutSeconds)
         replicaInfo.update(succeeded=True, tpeds=tpeds_tar_gz, traj=trajFile, **_load_sweep_info())
     except subprocess.SubprocessError as subprocessError:
         _log.warning(f'command "{cosi2_cmd}" failed with {subprocessError}')
+
+    replicaInfo.update(duration=time.time()-time_beg)
 
     return replicaInfo
 
@@ -191,9 +196,10 @@ def parse_args():
     parser.add_argument('--modelId', required=True, help='demographic model id')
     parser.add_argument('--simBlockId', required=True, help='string ID of the simulation block')
     parser.add_argument('--blockNum', type=int, required=True, help='number of the block of simulations')
-    parser.add_argument('--numSimsInBlock', type=int, required=True, help='number of replicas in the block')
-    parser.add_argument('--maxAttempts', type=int, required=True,
+    parser.add_argument('--numRepsPerBlock', type=int, required=True, help='number of replicas in the block')
+    parser.add_argument('--maxAttempts', type=int, default=10000000,
                         help='max # of times to try simulating forward frequency trajectory before giving up')
+    parser.add_argument('--repTimeoutSeconds', type=int, required=True, help='max time per replica')
 
     parser.add_argument('--outJson', required=True, help='write output json to this file')
     return parser.parse_args()
@@ -211,10 +217,10 @@ def do_main():
     args = parse_args()
 
     with contextlib.ExitStack() as exit_stack:
-        executor = exit_stack.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=min(args.numSimsInBlock,
+        executor = exit_stack.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=min(args.numRepsPerBlock,
                                                                                                   available_cpu_count())))
         replicaInfos = list(executor.map(functools.partial(run_one_replica, args=args, paramFile=constructParamFile(args)),
-                                         range(args.numSimsInBlock)))
+                                         range(args.numRepsPerBlock)))
     _write_json(args.outJson, dict(replicaInfos=replicaInfos))
     
 if __name__ == '__main__':

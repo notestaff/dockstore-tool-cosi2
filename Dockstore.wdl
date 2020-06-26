@@ -13,21 +13,21 @@ version 1.0
 #   figure out how to enable result caching without 
 #
 
-struct ReplicaInfo {
-  String modelId
-  String blockNum
-  Int replicaNum
-  Int succeeded
-  Int         randomSeed
-  File        tpeds
-  File traj
-  Int  selPop
-  Float selGen
-  Int selBegPop
-  Float selBegGen
-  Float selCoeff
-  Float selFreq
-}
+# struct ReplicaInfo {
+#   String modelId
+#   String blockNum
+#   Int replicaNum
+#   Int succeeded
+#   Int         randomSeed
+#   File        tpeds
+#   File traj
+#   Int  selPop
+#   Float selGen
+#   Int selBegPop
+#   Float selBegGen
+#   Float selCoeff
+#   Float selFreq
+# }
 
 task cosi2_run_one_sim_block {
   meta {
@@ -43,7 +43,7 @@ task cosi2_run_one_sim_block {
     simBlockId: "an ID of this simulation block (e.g. block number in a list of blocks)."
 
     ## optional
-    nSimsInBlock: "number of simulations in this block"
+    numRepsPerBlock: "number of simulations in this block"
     maxAttempts: "max number of attempts to simulate forward frequency trajectory before failing"
 
     # Outputs
@@ -57,15 +57,18 @@ task cosi2_run_one_sim_block {
     String       simBlockId
     String       modelId
     Int          blockNum
-    Int          nSimsInBlock = 1
+    Int          numRepsPerBlock = 1
+    Int          numCpusPerBlock = numRepsPerBlock
     Int          maxAttempts = 10000000
+    Int          repTimeoutSeconds = 300
     String       cosi2_docker = "quay.io/ilya_broad/dockstore-tool-cosi2@sha256:11df3a646c563c39b6cbf71490ec5cd90c1025006102e301e62b9d0794061e6a"
+    String       memoryPerBlock = "3 GB"
     File         taskScript
   }
 
   command <<<
     python3 ~{taskScript} --paramFileCommon ~{paramFileCommon} --paramFile ~{paramFile} --recombFile ~{recombFile} \
-      --simBlockId ~{simBlockId} --modelId ~{modelId} --blockNum ~{blockNum} --numSimsInBlock ~{nSimsInBlock} --maxAttempts ~{maxAttempts} --outJson out.json
+      --simBlockId ~{simBlockId} --modelId ~{modelId} --blockNum ~{blockNum} --numRepsPerBlock ~{numRepsPerBlock} --maxAttempts ~{maxAttempts} --repTimeoutSeconds ~{repTimeoutSeconds} --outJson out.json
   >>>
 
   output {
@@ -76,8 +79,8 @@ task cosi2_run_one_sim_block {
   runtime {
 #    docker: "quay.io/ilya_broad/cms-dev:2.0.1-15-gd48e1db-is-cms2-new"
     docker: cosi2_docker
-    memory: "3 GB"
-    cpu: 2
+    memory: memoryPerBlock
+    cpu: numCpusPerBlock
     dx_instance_type: "mem1_ssd1_v2_x4"
     volatile: true  # FIXME: not volatile if random seeds specified
   }
@@ -94,7 +97,7 @@ workflow run_sims_cosi2 {
     parameter_meta {
       paramFiles: "cosi2 parameter files specifying the demographic model (paramFileCommon is prepended to each)"
       recombFile: "Recombination map from which map of each simulated region is sampled"
-      nreps: "Number of replicates for _each_ demographic model."
+      nreps: "Number of replicates for _each_ file in paramFiles"
     }
 
     input {
@@ -102,15 +105,19 @@ workflow run_sims_cosi2 {
       Array[File] paramFiles
       File recombFile
       Int nreps = 1
-      Int nSimsPerBlock = 1
+      Int maxAttempts = 10000000
+      Int numRepsPerBlock = 1
+      Int numCpusPerBlock = numRepsPerBlock
+      Int repTimeoutSeconds = 600
+      String       memoryPerBlock = "3 GB"
       String       cosi2_docker = "quay.io/ilya_broad/dockstore-tool-cosi2@sha256:11df3a646c563c39b6cbf71490ec5cd90c1025006102e301e62b9d0794061e6a"
       File         taskScript
     }
-    Int nBlocks = nreps / nSimsPerBlock
+    Int numBlocks = nreps / numRepsPerBlock
     #Array[String] paramFileCommonLines = read_lines(paramFileCommonLines)
 
     scatter(paramFile in paramFiles) {
-        scatter(blockNum in range(nBlocks)) {
+        scatter(blockNum in range(numBlocks)) {
             call cosi2_run_one_sim_block {
                 input:
                    paramFileCommon = paramFileCommon,
@@ -119,7 +126,11 @@ workflow run_sims_cosi2 {
                    modelId=basename(paramFile, ".par"),
 	           simBlockId=basename(paramFile, ".par")+"_"+blockNum,
 	           blockNum=blockNum,
-	           nSimsInBlock=nSimsPerBlock,
+	           maxAttempts=maxAttempts,
+	           repTimeoutSeconds=repTimeoutSeconds,
+	           numRepsPerBlock=numRepsPerBlock,
+	           numCpusPerBlock=numCpusPerBlock,
+	           memoryPerBlock=memoryPerBlock,
 	           cosi2_docker=cosi2_docker,
 	           taskScript=taskScript
             }
